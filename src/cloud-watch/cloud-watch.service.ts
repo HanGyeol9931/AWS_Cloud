@@ -14,14 +14,43 @@ import {
   GetCostAndUsageCommand,
   GetCostAndUsageCommandInput,
 } from '@aws-sdk/client-cost-explorer';
+import {
+  AcceptHandshakeCommand,
+  Account,
+  CancelHandshakeCommand,
+  DescribeOrganizationCommand,
+  Handshake,
+  InviteAccountToOrganizationCommand,
+  ListAccountsCommand,
+  ListHandshakesForAccountCommand,
+  Organization,
+  OrganizationsClient,
+} from '@aws-sdk/client-organizations';
 
 @Injectable()
 export class CloudWatchService {
   private readonly cloudWatchClient: CloudWatchClient;
   private ec2Client: EC2Client;
   private costExplorerClient: CostExplorerClient;
+  private organizationsClient: OrganizationsClient;
+  private organizationsUserClient: OrganizationsClient;
 
   constructor() {
+    this.organizationsClient = new OrganizationsClient({
+      region: process.env.AWS_REGION,
+      credentials: {
+        accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+      },
+    });
+    this.organizationsUserClient = new OrganizationsClient({
+      region: process.env.AWS_REGION,
+      credentials: {
+        accessKeyId: process.env.AWS_USER_ACCESS_KEY_ID,
+        secretAccessKey: process.env.AWS_USER_SECRET_ACCESS_KEY,
+      },
+    });
+
     this.ec2Client = new EC2Client({
       region: process.env.AWS_REGION,
       credentials: {
@@ -268,5 +297,115 @@ export class CloudWatchService {
 
   private formatDate(date: Date): string {
     return date.toISOString().split('T')[0];
+  }
+
+  async inviteAccountToOrganization(email: string): Promise<string | null> {
+    // 먼저 기존 초대 확인
+    const existingInvitation = await this.checkExistingInvitation(email);
+
+    console.log('existingInvitation', existingInvitation);
+    if (existingInvitation) {
+      console.log(`Existing invitation found for ${email}`);
+      return existingInvitation.Id;
+    }
+
+    // 기존 초대가 없으면 새 초대 생성
+
+    const command = new InviteAccountToOrganizationCommand({
+      Target: { Type: 'EMAIL', Id: email },
+    });
+    const response = await this.organizationsClient.send(command);
+    return response.Handshake.Id;
+  }
+
+  async acceptHandshake(handshakeId: string): Promise<void> {
+    const command = new AcceptHandshakeCommand({ HandshakeId: handshakeId });
+    await this.organizationsUserClient.send(command);
+  }
+
+  async getOrganizationInfo(): Promise<Organization | null> {
+    try {
+      const command = new DescribeOrganizationCommand({});
+      const response = await this.organizationsClient.send(command);
+      return response.Organization;
+    } catch (error) {
+      console.error('Error fetching organization info:', error);
+      throw error;
+    }
+  }
+
+  async listMemberAccounts(): Promise<Account[]> {
+    try {
+      const command = new ListAccountsCommand({});
+      const response = await this.organizationsClient.send(command);
+      return response.Accounts || [];
+    } catch (error) {
+      console.error('Error listing member accounts:', error);
+      throw error;
+    }
+  }
+
+  private async checkExistingInvitation(
+    email: string,
+  ): Promise<Handshake | null> {
+    try {
+      const command = new ListHandshakesForAccountCommand({});
+      const response = await this.organizationsUserClient.send(command);
+
+      console.log(`Checking existing invitations for ${email}`);
+      console.log(
+        'All handshakes:',
+        JSON.stringify(response.Handshakes, null, 2),
+      );
+
+      const existingInvitation = response.Handshakes?.find(
+        (handshake) =>
+          handshake.Action === 'INVITE' &&
+          handshake.State === 'OPEN' &&
+          handshake.Parties?.some(
+            (party) =>
+              party.Type === 'EMAIL' &&
+              party.Id.toLowerCase() === email.toLowerCase(),
+          ),
+      );
+
+      if (existingInvitation) {
+        console.log(
+          `Found existing invitation: ${JSON.stringify(existingInvitation, null, 2)}`,
+        );
+      } else {
+        console.log(`No existing invitation found for ${email}`);
+      }
+
+      return existingInvitation || null;
+    } catch (error) {
+      console.error('Error in checkExistingInvitation:', error);
+      throw error;
+    }
+  }
+
+  async listInvitations(): Promise<Handshake[]> {
+    try {
+      const command = new ListHandshakesForAccountCommand({
+        Filter: {
+          ActionType: 'INVITE',
+        },
+      });
+      const response = await this.organizationsUserClient.send(command);
+      return response.Handshakes || [];
+    } catch (error) {
+      console.error('Error listing invitations:', error);
+      throw error;
+    }
+  }
+
+  async cancelInvitation(handshakeId: string): Promise<void> {
+    try {
+      const command = new CancelHandshakeCommand({ HandshakeId: handshakeId });
+      await this.organizationsClient.send(command);
+    } catch (error) {
+      console.error('Error canceling invitation:', error);
+      throw error;
+    }
   }
 }
