@@ -1,51 +1,56 @@
-import { Body, Controller, Post } from '@nestjs/common';
+import { Controller, Get, Query } from '@nestjs/common';
 import { CloudWatchService } from './cloud-watch.service';
 
 @Controller('cloudwatch')
 export class CloudWatchController {
   constructor(private readonly cloudWatchService: CloudWatchService) {}
 
-  @Post('info')
-  async getEC2InstancesInfo() {
-    console.log('실행완료');
-    return this.cloudWatchService.getEC2InstancesInfo();
-  }
-  @Post('billing')
-  async getBillingCosts() {
-    console.log('실행완료');
-    return this.cloudWatchService.getBillingCosts();
-  }
-  @Post('invite')
-  async inviteUser(@Body('email') email: string) {
-    const handshakeId =
-      await this.cloudWatchService.inviteAccountToOrganization(email);
-    return { message: 'Invitation sent', handshakeId };
+  @Get('instances')
+  async getAllInstanceDetails() {
+    return this.cloudWatchService.getAllInstanceDetails();
   }
 
-  @Post('accept')
-  async acceptInvitation(@Body('handshakeId') handshakeId: string) {
-    await this.cloudWatchService.acceptHandshake(handshakeId);
-    return { message: 'Invitation accepted' };
+  @Get('metrics')
+  async getAllMetrics(
+    @Query('instanceId') instanceId: string,
+    @Query('imageId') imageId: string,
+    @Query('instanceType') instanceType: string,
+  ) {
+    return this.cloudWatchService.getAllMetrics(
+      instanceId,
+      imageId,
+      instanceType,
+    );
   }
 
-  @Post('accept')
-  async cancelInvitation(@Body('handshakeId') handshakeId: string) {
-    await this.cloudWatchService.cancelInvitation(handshakeId);
-    return { message: 'Invitation cancel' };
+  @Get('cpu-usage')
+  async getCpuUsage(@Query('instanceId') instanceId: string) {
+    return this.cloudWatchService.getCpuUsage(instanceId);
   }
 
-  @Post('organization/info')
-  async getOrganizationInfo() {
-    return this.cloudWatchService.getOrganizationInfo();
+  @Get('memory-usage')
+  async getMemoryUsage(
+    @Query('instanceId') instanceId: string,
+    @Query('imageId') imageId: string,
+    @Query('instanceType') instanceType: string,
+  ) {
+    return this.cloudWatchService.getMemoryUsage(
+      instanceId,
+      imageId,
+      instanceType,
+    );
   }
 
-  @Post('organization/accounts')
-  async listMemberAccounts() {
-    return this.cloudWatchService.listMemberAccounts();
-  }
-
-  @Post('organization/invitation')
-  async listInvitations() {
-    return this.cloudWatchService.listInvitations();
+  @Get('disk-usage')
+  async getDiskUsage(
+    @Query('instanceId') instanceId: string,
+    @Query('imageId') imageId: string,
+    @Query('instanceType') instanceType: string,
+  ) {
+    return this.cloudWatchService.getDiskUsage(
+      instanceId,
+      imageId,
+      instanceType,
+    );
   }
 }

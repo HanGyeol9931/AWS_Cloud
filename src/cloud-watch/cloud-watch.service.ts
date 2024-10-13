@@ -1,411 +1,243 @@
 import { Injectable } from '@nestjs/common';
-import { CloudWatchClient } from '@aws-sdk/client-cloudwatch';
 import {
-  DescribeInstancesCommand,
-  DescribeInstanceTypesCommand,
-  DescribeVolumesCommand,
-  EC2Client,
-  Instance,
-  InstanceTypeInfo,
-  Volume,
-} from '@aws-sdk/client-ec2';
-import {
-  CostExplorerClient,
-  GetCostAndUsageCommand,
-  GetCostAndUsageCommandInput,
-} from '@aws-sdk/client-cost-explorer';
-import {
-  AcceptHandshakeCommand,
-  Account,
-  CancelHandshakeCommand,
-  DescribeOrganizationCommand,
-  Handshake,
-  InviteAccountToOrganizationCommand,
-  ListAccountsCommand,
-  ListHandshakesForAccountCommand,
-  Organization,
-  OrganizationsClient,
-} from '@aws-sdk/client-organizations';
+  CloudWatchClient,
+  GetMetricDataCommand,
+} from '@aws-sdk/client-cloudwatch';
+import { DescribeInstancesCommand, EC2Client } from '@aws-sdk/client-ec2';
 
 @Injectable()
 export class CloudWatchService {
-  private readonly cloudWatchClient: CloudWatchClient;
+  private cloudwatchClient: CloudWatchClient;
   private ec2Client: EC2Client;
-  private costExplorerClient: CostExplorerClient;
-  private organizationsClient: OrganizationsClient;
-  private organizationsUserClient: OrganizationsClient;
 
   constructor() {
-    this.organizationsClient = new OrganizationsClient({
-      region: process.env.AWS_REGION,
+    this.cloudwatchClient = new CloudWatchClient({
+      region: 'ap-northeast-2', // 사용중인 AWS 리전
       credentials: {
-        accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+        accessKeyId: process.env.AWS_ACCESS_KEY_ID, // 환경 변수에서 설정
         secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
       },
     });
-    this.organizationsUserClient = new OrganizationsClient({
-      region: process.env.AWS_REGION,
-      credentials: {
-        accessKeyId: process.env.AWS_USER_ACCESS_KEY_ID,
-        secretAccessKey: process.env.AWS_USER_SECRET_ACCESS_KEY,
-      },
-    });
-
     this.ec2Client = new EC2Client({
-      region: process.env.AWS_REGION,
+      region: 'ap-northeast-2', // AWS 리전 설정
       credentials: {
         accessKeyId: process.env.AWS_ACCESS_KEY_ID,
         secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
       },
     });
-
-    this.costExplorerClient = new CostExplorerClient({
-      region: process.env.AWS_REGION,
-      credentials: {
-        accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
-      },
-    }); // 서울 리전
   }
 
-  async getEC2InstancesInfo() {
-    try {
-      const instances = await this.getAllInstances();
-      const instanceTypeInfos = await this.getInstanceTypeInfos(instances);
-      const volumeInfos = await this.getVolumesInfo(instances);
+  // 모든 EC2 인스턴스의 InstanceId, ImageId, InstanceType 조회하는 메서드
+  async getAllInstanceDetails() {
+    const params = {};
+    const command = new DescribeInstancesCommand(params);
+    const data = await this.ec2Client.send(command);
 
-      return instances.map((instance) =>
-        this.mapInstanceInfo(instance, instanceTypeInfos, volumeInfos),
-      );
+    // Reservations 배열에서 인스턴스 ID, Image ID, Instance Type만 추출
+    const instanceDetails = data.Reservations?.flatMap((reservation) =>
+      reservation.Instances
+        ? reservation.Instances.map((instance) => ({
+            InstanceId: instance.InstanceId,
+            ImageId: instance.ImageId,
+            InstanceType: instance.InstanceType,
+          }))
+        : [],
+    );
+
+    return instanceDetails;
+  }
+
+  async getAllMetrics(
+    instanceId: string,
+    imageId: string,
+    instanceType: string,
+  ) {
+    if (!instanceId || instanceId.length === 0) {
+      throw new Error('Invalid Instance ID');
+    }
+
+    try {
+      // CPU, 메모리, 디스크 사용량을 동시에 가져오기 위해 Promise.all 사용
+      const [cpuUsage, memoryUsage, diskUsage] = await Promise.all([
+        this.getCpuUsage(instanceId),
+        this.getMemoryUsage(instanceId, imageId, instanceType),
+        this.getDiskUsage(instanceId, imageId, instanceType),
+      ]);
+
+      // 필요한 형태로 데이터를 매핑하여 반환
+      return {
+        instanceId,
+        imageId,
+        instanceType,
+        cpuUsage: cpuUsage[0]?.Values || [], // cpu 메트릭 값
+        memoryUsage: memoryUsage[0]?.Values || [], // 메모리 메트릭 값
+        diskUsage: diskUsage[0]?.Values || [], // 디스크 메트릭 값
+      };
     } catch (error) {
-      console.error('Error fetching EC2 instances:', error);
-      throw error;
+      console.error('Error fetching metrics:', error);
+      throw new Error('Unable to fetch metrics');
     }
   }
 
-  private async getAllInstances(): Promise<Instance[]> {
-    const command = new DescribeInstancesCommand({});
-    const data = await this.ec2Client.send(command);
-    return data.Reservations.flatMap((reservation) => reservation.Instances);
-  }
+  // CPU 사용량 가져오기
+  async getCpuUsage(instanceId: string) {
+    if (!instanceId || instanceId.length === 0) {
+      throw new Error('Invalid Instance ID');
+    }
 
-  private async getInstanceTypeInfos(
-    instances: Instance[],
-  ): Promise<Record<string, InstanceTypeInfo>> {
-    const uniqueInstanceTypes = [
-      ...new Set(instances.map((instance) => instance.InstanceType)),
-    ];
-    const command = new DescribeInstanceTypesCommand({
-      InstanceTypes: uniqueInstanceTypes,
-    });
-    const response = await this.ec2Client.send(command);
-
-    return response.InstanceTypes.reduce(
-      (acc, type) => {
-        if (type.InstanceType) {
-          acc[type.InstanceType] = type;
-        }
-        return acc;
-      },
-      {} as Record<string, InstanceTypeInfo>,
-    );
-  }
-
-  private async getVolumesInfo(
-    instances: Instance[],
-  ): Promise<Record<string, Volume>> {
-    const volumeIds = instances
-      .flatMap((instance) =>
-        instance.BlockDeviceMappings.filter(
-          (device) => device.Ebs && device.Ebs.VolumeId,
-        ).map((device) => device.Ebs.VolumeId),
-      )
-      .filter((id): id is string => id !== undefined);
-
-    const command = new DescribeVolumesCommand({ VolumeIds: volumeIds });
-    const response = await this.ec2Client.send(command);
-
-    return response.Volumes.reduce(
-      (acc, volume) => {
-        if (volume.VolumeId) {
-          acc[volume.VolumeId] = volume;
-        }
-        return acc;
-      },
-      {} as Record<string, Volume>,
-    );
-  }
-
-  private mapInstanceInfo(
-    instance: Instance,
-    instanceTypeInfos: Record<string, InstanceTypeInfo>,
-    volumeInfos: Record<string, Volume>,
-  ) {
-    const typeInfo = instance.InstanceType
-      ? instanceTypeInfos[instance.InstanceType]
-      : undefined;
-
-    return {
-      InstanceId: instance.InstanceId,
-      InstanceType: instance.InstanceType,
-      State: instance.State?.Name,
-      PublicIpAddress: instance.PublicIpAddress,
-      PrivateIpAddress: instance.PrivateIpAddress,
-      LaunchTime: instance.LaunchTime,
-      CPU: {
-        vCPUs: typeInfo?.VCpuInfo?.DefaultVCpus || 'N/A',
-      },
-      Memory: {
-        SizeInGiB: typeInfo?.MemoryInfo?.SizeInMiB
-          ? (typeInfo.MemoryInfo.SizeInMiB / 1024).toFixed(2)
-          : 'N/A',
-      },
-      Storage: {
-        Devices: instance.BlockDeviceMappings.filter(
-          (device) => device.Ebs && device.Ebs.VolumeId,
-        ).map((device) => {
-          const volumeInfo = device.Ebs?.VolumeId
-            ? volumeInfos[device.Ebs.VolumeId]
-            : undefined;
-          return {
-            DeviceName: device.DeviceName,
-            VolumeId: device.Ebs?.VolumeId,
-            SizeInGiB: volumeInfo?.Size || 'N/A',
-          };
-        }),
-      },
-      Tags:
-        instance.Tags?.reduce(
-          (acc, tag) => {
-            if (tag.Key) {
-              acc[tag.Key] = tag.Value || '';
-            }
-            return acc;
-          },
-          {} as Record<string, string>,
-        ) || {},
-    };
-  }
-
-  async getBillingCosts() {
-    try {
-      const billingData = await this.getCurrentAndLastMonthActualBilledCost();
-      return {
-        status: 'success',
-        data: {
-          lastMonth: {
-            startDate: billingData.lastMonth.startDate,
-            endDate: billingData.lastMonth.endDate,
-            amortizedCost: billingData.lastMonth.amortizedCost,
-            unblendedCost: billingData.lastMonth.unblendedCost,
-            currency: billingData.lastMonth.currency,
+    const params = {
+      StartTime: new Date(new Date().getTime() - 60 * 60 * 1000), // 1시간 전
+      EndTime: new Date(),
+      MetricDataQueries: [
+        {
+          Id: 'cpuUsage',
+          MetricStat: {
+            Metric: {
+              Namespace: 'AWS/EC2',
+              MetricName: 'CPUUtilization',
+              Dimensions: [
+                {
+                  Name: 'InstanceId',
+                  Value: instanceId, // 인스턴스 ID 값
+                },
+              ],
+            },
+            Period: 60, // 1분 간격
+            Stat: 'Average',
           },
         },
-      };
-    } catch (error) {
-      console.error('Error fetching billing costs:', error);
-      return {
-        status: 'error',
-        message: '비용 데이터를 가져오는 중 오류가 발생했습니다.',
-        error: error.message,
-      };
-    }
-  }
-
-  private async getCurrentAndLastMonthActualBilledCost() {
-    const now = new Date();
-
-    const lastMonthStart = new Date(
-      Date.UTC(now.getFullYear(), now.getMonth() - 1, 1),
-    );
-    const lastMonthEnd = new Date(
-      Date.UTC(now.getFullYear(), now.getMonth(), 1), // 이번 달 1일로 설정하여 정확한 금액 계산
-    );
-
-    const lastMonthEndDisplay = new Date(
-      Date.UTC(now.getFullYear(), now.getMonth(), 0),
-    );
-
-    console.log('lastMonthStart', lastMonthStart);
-    console.log('lastMonthEnd', lastMonthEnd);
-
-    const lastMonthCost = await this.getActualBilledCost(
-      lastMonthStart,
-      lastMonthEnd,
-      lastMonthEndDisplay,
-    );
-
-    return {
-      lastMonth: lastMonthCost,
-    };
-  }
-
-  private async getActualBilledCost(
-    startDate: Date,
-    endDate: Date,
-    endDisplay: Date,
-  ) {
-    const params: GetCostAndUsageCommandInput = {
-      TimePeriod: {
-        Start: this.formatDate(startDate),
-        End: this.formatDate(endDate),
-      },
-      Granularity: 'MONTHLY',
-      Metrics: [
-        'AmortizedCost',
-        'UnblendedCost',
-        'NetAmortizedCost',
-        'NetUnblendedCost',
-        'BlendedCost', // BlendedCost 추가
       ],
     };
 
-    try {
-      const command = new GetCostAndUsageCommand(params);
-      const response = await this.costExplorerClient.send(command);
-
-      let totalAmortizedCost = 0;
-      let totalUnblendedCost = 0;
-      let totalNetAmortizedCost = 0;
-      let totalNetUnblendedCost = 0;
-
-      response.ResultsByTime.forEach((result) => {
-        totalAmortizedCost += parseFloat(result.Total.AmortizedCost.Amount);
-        totalUnblendedCost += parseFloat(result.Total.UnblendedCost.Amount);
-        totalNetAmortizedCost += parseFloat(
-          result.Total.NetAmortizedCost.Amount,
-        );
-        totalNetUnblendedCost += parseFloat(
-          result.Total.NetUnblendedCost.Amount,
-        );
-      });
-
-      return {
-        startDate: this.formatDate(startDate),
-        endDate: this.formatDate(endDisplay),
-        amortizedCost: totalAmortizedCost.toFixed(2),
-        unblendedCost: totalUnblendedCost.toFixed(2),
-        netAmortizedCost: totalNetAmortizedCost.toFixed(2),
-        netUnblendedCost: totalNetUnblendedCost.toFixed(2),
-        currency: response.ResultsByTime[0]?.Total.AmortizedCost.Unit || 'USD',
-      };
-    } catch (error) {
-      console.error('Error fetching actual billed cost:', error);
-      throw error;
-    }
+    const command = new GetMetricDataCommand(params);
+    const data = await this.cloudwatchClient.send(command);
+    return data.MetricDataResults;
   }
 
-  private formatDate(date: Date): string {
-    return date.toISOString().split('T')[0];
-  }
-
-  async inviteAccountToOrganization(email: string): Promise<string | null> {
-    // 먼저 기존 초대 확인
-    const existingInvitation = await this.checkExistingInvitation(email);
-
-    console.log('existingInvitation', existingInvitation);
-    if (existingInvitation) {
-      console.log(`Existing invitation found for ${email}`);
-      return existingInvitation.Id;
-    }
-
-    // 기존 초대가 없으면 새 초대 생성
-
-    const command = new InviteAccountToOrganizationCommand({
-      Target: { Type: 'EMAIL', Id: email },
-    });
-    const response = await this.organizationsClient.send(command);
-    return response.Handshake.Id;
-  }
-
-  async acceptHandshake(handshakeId: string): Promise<void> {
-    const command = new AcceptHandshakeCommand({ HandshakeId: handshakeId });
-    await this.organizationsUserClient.send(command);
-  }
-
-  async getOrganizationInfo(): Promise<Organization | null> {
-    try {
-      const command = new DescribeOrganizationCommand({});
-      const response = await this.organizationsClient.send(command);
-      return response.Organization;
-    } catch (error) {
-      console.error('Error fetching organization info:', error);
-      throw error;
-    }
-  }
-
-  async listMemberAccounts(): Promise<Account[]> {
-    try {
-      const command = new ListAccountsCommand({});
-      const response = await this.organizationsClient.send(command);
-      return response.Accounts || [];
-    } catch (error) {
-      console.error('Error listing member accounts:', error);
-      throw error;
-    }
-  }
-
-  private async checkExistingInvitation(
-    email: string,
-  ): Promise<Handshake | null> {
-    try {
-      const command = new ListHandshakesForAccountCommand({});
-      const response = await this.organizationsUserClient.send(command);
-
-      console.log(`Checking existing invitations for ${email}`);
-      console.log(
-        'All handshakes:',
-        JSON.stringify(response.Handshakes, null, 2),
-      );
-
-      const existingInvitation = response.Handshakes?.find(
-        (handshake) =>
-          handshake.Action === 'INVITE' &&
-          handshake.State === 'OPEN' &&
-          handshake.Parties?.some(
-            (party) =>
-              party.Type === 'EMAIL' &&
-              party.Id.toLowerCase() === email.toLowerCase(),
-          ),
-      );
-
-      if (existingInvitation) {
-        console.log(
-          `Found existing invitation: ${JSON.stringify(existingInvitation, null, 2)}`,
-        );
-      } else {
-        console.log(`No existing invitation found for ${email}`);
-      }
-
-      return existingInvitation || null;
-    } catch (error) {
-      console.error('Error in checkExistingInvitation:', error);
-      throw error;
-    }
-  }
-
-  async listInvitations(): Promise<Handshake[]> {
-    try {
-      const command = new ListHandshakesForAccountCommand({
-        Filter: {
-          ActionType: 'INVITE',
+  // 메모리 사용량 가져오기
+  async getMemoryUsage(
+    instanceId: string,
+    imageId: string,
+    instanceType: string,
+  ) {
+    console.log(instanceId, imageId, instanceType);
+    const params = {
+      StartTime: new Date(new Date().getTime() - 60 * 60 * 1000), // 1시간 전부터
+      EndTime: new Date(),
+      MetricDataQueries: [
+        {
+          Id: 'memoryUsage',
+          MetricStat: {
+            Metric: {
+              Namespace: 'CWAgent',
+              MetricName: 'mem_used_percent', // 메모리 사용률 메트릭
+              Dimensions: [
+                {
+                  Name: 'InstanceId',
+                  Value: instanceId,
+                },
+                {
+                  Name: 'ImageId',
+                  Value: imageId,
+                },
+                {
+                  Name: 'InstanceType',
+                  Value: instanceType,
+                },
+              ],
+            },
+            Period: 60, // 1분 간격
+            Stat: 'Average',
+          },
         },
-      });
-      const response = await this.organizationsUserClient.send(command);
-      return response.Handshakes || [];
-    } catch (error) {
-      console.error('Error listing invitations:', error);
-      throw error;
-    }
+      ],
+    };
+
+    const command = new GetMetricDataCommand(params);
+    const data = await this.cloudwatchClient.send(command);
+    return data.MetricDataResults;
+  }
+  // 모든 디스크 정보 추출
+  extractAllDiskInfo(instanceDetails: any) {
+    const blockDeviceMappings = instanceDetails.BlockDeviceMappings;
+
+    // 모든 디바이스 정보 추출
+    return blockDeviceMappings.map((mapping) => ({
+      device: mapping.DeviceName || '/dev/xvda1',
+      fstype: 'xfs', // 예시로 기본값 지정
+      mountPath: '/', // 기본값으로 루트 경로
+    }));
+  }
+  // 디스크 사용량 가져오기
+  async getDiskUsage(
+    instanceId: string,
+    imageId: string,
+    instanceType: string,
+  ) {
+    console.log(instanceId, imageId, instanceType);
+
+    // EC2 인스턴스의 디스크 정보를 조회하는 부분
+    const instanceDetails = await this.getEC2InstanceDetails(instanceId);
+    const deviceInfo = this.extractDiskInfo(instanceDetails);
+    const devices = this.extractAllDiskInfo(instanceDetails);
+
+    console.log(deviceInfo);
+    console.log(devices);
+
+    const dimensions = [
+      { Name: 'InstanceId', Value: instanceId },
+      { Name: 'ImageId', Value: imageId },
+      { Name: 'InstanceType', Value: instanceType },
+      { Name: 'device', Value: 'xvda1' }, // 디스크 장치 이름
+      { Name: 'fstype', Value: deviceInfo.fstype }, // 파일 시스템 타입
+      { Name: 'path', Value: deviceInfo.mountPath }, // 마운트 경로
+    ];
+
+    const params = {
+      StartTime: new Date(new Date().getTime() - 60 * 60 * 1000), // 1시간 전부터
+      EndTime: new Date(),
+      MetricDataQueries: [
+        {
+          Id: 'diskUsage',
+          MetricStat: {
+            Metric: {
+              Namespace: 'CWAgent',
+              MetricName: 'disk_used_percent',
+              Dimensions: dimensions,
+            },
+            Period: 60, // 1분 간격
+            Stat: 'Average',
+          },
+        },
+      ],
+    };
+
+    const command = new GetMetricDataCommand(params);
+    const data = await this.cloudwatchClient.send(command);
+    return data.MetricDataResults;
   }
 
-  async cancelInvitation(handshakeId: string): Promise<void> {
-    try {
-      const command = new CancelHandshakeCommand({ HandshakeId: handshakeId });
-      await this.organizationsClient.send(command);
-    } catch (error) {
-      console.error('Error canceling invitation:', error);
-      throw error;
-    }
+  // EC2 인스턴스의 디스크 정보를 조회하는 메서드
+  async getEC2InstanceDetails(instanceId: string) {
+    const params = {
+      InstanceIds: [instanceId],
+    };
+
+    const command = new DescribeInstancesCommand(params);
+    const data = await this.ec2Client.send(command);
+
+    return data.Reservations?.[0]?.Instances?.[0];
+  }
+
+  // 디스크 정보 추출 메서드
+  extractDiskInfo(instanceDetails: any) {
+    const blockDeviceMappings = instanceDetails.BlockDeviceMappings;
+
+    // 실제 디바이스 정보 추출 (가장 첫 번째 장치를 가져오는 예시)
+    const device = blockDeviceMappings[0]?.DeviceName || '/dev/xvda1'; // 기본 값 설정
+    const fstype = 'xfs'; // 파일 시스템 타입 기본 값 (필요시 수동 변경)
+    const mountPath = '/'; // 기본 루트 경로
+
+    return { device, fstype, mountPath };
   }
 }

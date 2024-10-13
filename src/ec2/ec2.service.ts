@@ -23,6 +23,24 @@ export class EC2Service {
       },
     });
   }
+  // // EC2 인스턴스 정보를 조회하는 메인 메서드
+  // async getEC2InstancesInfo(userId: string) {
+
+  //   // const
+  //   try {
+  //     const instances = await this.getAllInstances();
+  //     const instanceTypeInfos = await this.getInstanceTypeInfos(instances);
+  //     const volumeInfos = await this.getVolumesInfo(instances);
+
+  //     // 각 인스턴스 정보를 매핑하여 반환
+  //     return instances.map((instance) =>
+  //       this.mapInstanceInfo(instance, instanceTypeInfos, volumeInfos),
+  //     );
+  //   } catch (error) {
+  //     console.error('EC2 인스턴스 정보 조회 중 오류 발생:', error);
+  //     throw error;
+  //   }
+  // }
 
   // EC2 인스턴스 정보를 조회하는 메인 메서드
   async getEC2InstancesInfo() {

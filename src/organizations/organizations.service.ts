@@ -33,14 +33,14 @@ export class OrganizationsService {
   }
 
   // 조직에 계정 초대
-  async inviteAccountToOrganization(email: string): Promise<string | null> {
+  async inviteAccountToOrganization(email: string): Promise<any | null> {
     // 먼저 기존 초대 확인
     const existingInvitation = await this.checkExistingInvitation(email);
 
     console.log('existingInvitation', existingInvitation);
     if (existingInvitation) {
       console.log(`${email}에 대한 기존 초대가 있습니다.`);
-      return existingInvitation.Id;
+      return existingInvitation;
     }
 
     // 기존 초대가 없으면 새 초대 생성
